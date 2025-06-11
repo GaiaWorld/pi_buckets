@@ -1,0 +1,10 @@
+[package]
+name = "pi_buckets"
+version = "0.1.0"
+authors = ["zmax <zmax@gaia.world>"]
+edition = "2021"
+description = "lock-free & auto-expansion buckets"
+repository = "https://github.com/GaiaWorld/pi_buckets.git"
+license = "MIT OR Apache-2.0"
+keywords = ["pi", "buckets", "lock-free", "auto-expansion"]
+
