@@ -4,12 +4,10 @@
 //! 第一个固定槽位的Vec长度为32。
 //! 固定槽迭代性能比Vec慢1-10倍， 主要损失在切换bucket时，原子操作及缓存失效。
 
-#![feature(unsafe_cell_access)]
-#![feature(vec_into_raw_parts)]
 #![feature(test)]
 extern crate test;
 
-use std::mem::{forget, replace, transmute};
+use std::mem::{forget, replace, transmute, ManuallyDrop};
 use std::ops::{Index, IndexMut, Range};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -556,7 +554,7 @@ impl<T: Default + Clone> Clone for Buckets<T> {
                 continue;
             }
             let vec = to_bucket_vec(ptr, i);
-            *bucket = vec.clone().into_raw_parts().0;
+            *bucket = ManuallyDrop::new(vec.clone()).as_mut_ptr();
             forget(vec);
         }
         Buckets {
@@ -718,7 +716,7 @@ fn to_bucket_vec<T>(ptr: *mut T, bucket: usize) -> Vec<T> {
 pub fn bucket_alloc<T: Default>(len: usize) -> *mut T {
     let mut entries: Vec<T> = Vec::with_capacity(len);
     entries.resize_with(entries.capacity(), || T::default());
-    entries.into_raw_parts().0
+    ManuallyDrop::new(entries).as_mut_ptr()
 }
 
 fn bucket_init<T: Default>(share_ptr: &AtomicPtr<T>, len: usize, lock: &Mutex<()>) -> *mut T {
@@ -792,7 +790,7 @@ impl Location {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{mem::ManuallyDrop, sync::{Arc, Mutex}};
 
     use test::Bencher;
 
@@ -857,7 +855,7 @@ mod tests {
     fn test_arc1() {
         let vec: Vec<Option<Arc<usize>>> = Vec::new();
         let vec1 = vec.clone();
-        println!("test_arc1 start:, {:?}", vec1.into_raw_parts().0.is_null());
+        println!("test_arc1 start:, {:?}", ManuallyDrop::new(vec1).as_mut_ptr());
         let a1 = {
             let arr = crate::Buckets::new();
             for i in 0..6 {

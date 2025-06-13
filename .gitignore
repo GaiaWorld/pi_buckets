@@ -4,3 +4,4 @@
 /.cargo
 /Cargo.lock
 /.vscode/tasks.json
+/*.log
