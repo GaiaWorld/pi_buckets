@@ -4,9 +4,6 @@
 //! 第一个固定槽位的Vec长度为32。
 //! 固定槽迭代性能比Vec慢1-10倍， 主要损失在切换bucket时，原子操作及缓存失效。
 
-#![feature(test)]
-extern crate test;
-
 use std::mem::{forget, replace, transmute, ManuallyDrop};
 use std::ops::{Index, IndexMut, Range};
 use std::ptr::{null, null_mut};
@@ -121,10 +118,6 @@ impl<T: Default> Buckets<T> {
     /// ```
     #[inline(always)]
     pub fn with_capacity(capacity: usize) -> Buckets<T> {
-        Self::with_capacity_multiple(capacity, 1)
-    }
-
-    pub fn with_capacity_multiple(capacity: usize, multiple: usize) -> Buckets<T> {
         let mut buckets = [null_mut(); BUCKETS];
         if capacity == 0 {
             return Buckets {
@@ -135,7 +128,7 @@ impl<T: Default> Buckets<T> {
         let end = Location::of(capacity).bucket as usize;
         for (i, bucket) in buckets[..=end].iter_mut().enumerate() {
             let len = Location::bucket_len(i);
-            *bucket = bucket_alloc(len * multiple);
+            *bucket = bucket_alloc(len);
         }
 
         Buckets {
@@ -412,7 +405,7 @@ impl<T: Default> Buckets<T> {
     /// assert_eq!(iterator.next(), None);
     /// assert_eq!(iterator.size_hint().0, 0);
     /// ```
-    #[inline]
+    #[inline(always)]
     pub fn iter(&self) -> BucketIter<'_, T> {
         self.slice_row(0..MAX_ENTRIES, 0)
     }
@@ -433,30 +426,23 @@ impl<T: Default> Buckets<T> {
     /// assert_eq!(*r, 4);
     /// assert_eq!(iterator.next(), None);
     /// ```
+    #[inline(always)]
     pub fn slice(&self, range: Range<usize>) -> BucketIter<'_, T> {
         self.slice_row(range, 0)
     }
     pub fn slice_row(&self, range: Range<usize>, capacity: usize) -> BucketIter<'_, T> {
         let start = Location::of(range.start - capacity);
         let end = Location::of(range.end - capacity);
-        BucketIter::new(
-            null_mut(),
-            start,
-            end.entry,
-            end.bucket,
-            &self,
-            capacity,
-        )
-        .init_iter()
+        BucketIter::new(null_mut(), start, end.entry, end.bucket, &self, capacity).init_iter()
     }
 
     #[inline(always)]
     pub unsafe fn load_entries(&self, bucket: usize) -> *mut T {
-        self.buckets.get_unchecked(bucket).load(Ordering::Relaxed)
+        self.buckets.get_unchecked(bucket).load(Ordering::Acquire)
     }
     #[inline(always)]
     pub unsafe fn entries(&self, bucket: usize) -> *mut T {
-        *self.buckets.get_unchecked(bucket).as_ptr()
+        self.buckets.get_unchecked(bucket).load(Ordering::Acquire)
     }
     #[inline(always)]
     pub unsafe fn entries_mut(&mut self, bucket: usize) -> *mut T {
@@ -466,7 +452,7 @@ impl<T: Default> Buckets<T> {
     pub fn load_alloc_bucket(&self, location: &Location) -> *mut T {
         let bucket = unsafe { self.buckets.get_unchecked(location.bucket as usize) };
         // safety: `location.bucket` is always in bounds
-        let mut entries = bucket.load(Ordering::Relaxed);
+        let mut entries = bucket.load(Ordering::Acquire);
         // bucket is uninitialized
         if entries.is_null() {
             entries = bucket_init(bucket, location.len, &self.lock)
@@ -490,7 +476,6 @@ impl<T: Default> Buckets<T> {
         &self.buckets
     }
 }
-
 
 impl<T: Default> Index<usize> for Buckets<T> {
     type Output = T;
@@ -520,7 +505,6 @@ impl<T> Drop for Buckets<T> {
         }
     }
 }
-
 
 impl<T: Default> FromIterator<T> for Buckets<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
@@ -635,7 +619,8 @@ impl<'a, T> BucketIter<'a, T> {
     #[inline(always)]
     fn load_ptr(&mut self) {
         self.ptr = unsafe {
-            self.buckets.buckets
+            self.buckets
+                .buckets
                 .get_unchecked(self.start.bucket as usize)
                 .load(Ordering::Relaxed)
         };
@@ -692,10 +677,10 @@ impl<'a, T> Iterator for BucketIter<'a, T> {
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         if self.start.entry < self.start.len {
-                let r = self.get();
-                self.start.entry += 1;
-                return Some(r);
-            }
+            let r = self.get();
+            self.start.entry += 1;
+            return Some(r);
+        }
         return self.next_bucket();
         // 将代码内联后， 性能由10ns变为40ns
     }
@@ -704,7 +689,6 @@ impl<'a, T> Iterator for BucketIter<'a, T> {
         self.size()
     }
 }
-
 
 /// take vec.
 #[inline(always)]
@@ -724,11 +708,10 @@ fn bucket_init<T: Default>(share_ptr: &AtomicPtr<T>, len: usize, lock: &Mutex<()
     let mut ptr = share_ptr.load(Ordering::Relaxed);
     if ptr.is_null() {
         ptr = bucket_alloc(len);
-        share_ptr.store(ptr, Ordering::Relaxed);
+        share_ptr.store(ptr, Ordering::Release);
     }
     ptr
 }
-
 
 #[derive(Debug, Default, Clone)]
 pub struct Location {
@@ -790,42 +773,42 @@ impl Location {
 
 #[cfg(test)]
 mod tests {
-    use std::{mem::ManuallyDrop, sync::{Arc, Mutex}};
-
-    use test::Bencher;
+    use std::{
+        mem::ManuallyDrop,
+        sync::{Arc, Mutex},
+    };
 
     use crate::*;
     static mut AAA: u64 = 0;
 
     #[test]
-    fn test_iter () {
-    let arr = buckets![1, 2, 4];
-    arr.insert(&Location::of(98), 98);
-    let mut iterator = arr.iter();
-    assert_eq!(iterator.size_hint().0, 32);
-    let r = iterator.next().unwrap();
-    assert_eq!((iterator.index() - 1, *r), (0, 1));
-    let r = iterator.next().unwrap();
-    assert_eq!((iterator.index() - 1, *r), (1, 2));
-    let r = iterator.next().unwrap();
-    assert_eq!((iterator.index() - 1, *r), (2, 4));
-    for i in 3..32 {
+    fn test_iter() {
+        let arr = buckets![1, 2, 4];
+        arr.insert(&Location::of(98), 98);
+        let mut iterator = arr.iter();
+        assert_eq!(iterator.size_hint().0, 32);
         let r = iterator.next().unwrap();
-        assert_eq!((iterator.index() - 1, *r), (i, 0));
-    }
-    for i in 96..98 {
+        assert_eq!((iterator.index() - 1, *r), (0, 1));
         let r = iterator.next().unwrap();
-        assert_eq!((iterator.index() - 1, *r), (i, 0));
-    }
-    let r = iterator.next().unwrap();
-    assert_eq!((iterator.index() - 1, *r), (98, 98));
-    for i in 99..224 {
+        assert_eq!((iterator.index() - 1, *r), (1, 2));
         let r = iterator.next().unwrap();
-        assert_eq!((iterator.index() - 1, *r), (i, 0));
-    }
-    assert_eq!(iterator.next(), None);
-    assert_eq!(iterator.size_hint().0, 0);
-
+        assert_eq!((iterator.index() - 1, *r), (2, 4));
+        for i in 3..32 {
+            let r = iterator.next().unwrap();
+            assert_eq!((iterator.index() - 1, *r), (i, 0));
+        }
+        for i in 96..98 {
+            let r = iterator.next().unwrap();
+            assert_eq!((iterator.index() - 1, *r), (i, 0));
+        }
+        let r = iterator.next().unwrap();
+        assert_eq!((iterator.index() - 1, *r), (98, 98));
+        for i in 99..224 {
+            let r = iterator.next().unwrap();
+            assert_eq!((iterator.index() - 1, *r), (i, 0));
+        }
+        assert_eq!(iterator.next(), None);
+        assert_eq!(iterator.size_hint().0, 0);
     }
     #[test]
     fn test_arc() {
@@ -855,7 +838,10 @@ mod tests {
     fn test_arc1() {
         let vec: Vec<Option<Arc<usize>>> = Vec::new();
         let vec1 = vec.clone();
-        println!("test_arc1 start:, {:?}", ManuallyDrop::new(vec1).as_mut_ptr());
+        println!(
+            "test_arc1 start:, {:?}",
+            ManuallyDrop::new(vec1).as_mut_ptr()
+        );
         let a1 = {
             let arr = crate::Buckets::new();
             for i in 0..6 {
@@ -940,55 +926,5 @@ mod tests {
         assert_eq!(max.bucket as usize, BUCKETS - 1);
         assert_eq!(max.len, 1 << 31);
         assert_eq!(max.entry, (1 << 31) - 1);
-    }
-    #[bench]
-    fn bench_loc(b: &mut Bencher) {
-        b.iter(move || {
-            for i in 0..1000 {
-                unsafe { AAA += Location::of(i).entry as u64 };
-            }
-        });
-    }
-    #[bench]
-    fn bench_arr(b: &mut Bencher) {
-        let mut arr = Buckets::new();
-        for i in 0..2000 {
-            *arr.alloc(&Location::of(i)) = 0;
-        }
-        b.iter(move || {
-            for i in arr.slice(100..200) {
-                unsafe { AAA += *i };
-            }
-        });
-    }
-    #[bench]
-    fn bench_vec(b: &mut Bencher) {
-        let mut arr: Vec<u64> = Vec::with_capacity(0);
-        for _ in 0..100 {
-            arr.push(0u64);
-        }
-        b.iter(move || {
-            for i in arr.iter() {
-                unsafe { AAA += *i };
-            }
-        });
-    }
-    #[bench]
-    fn bench_vec1(b: &mut Bencher) {
-        let mut arrs = [0; 1].map(|_| Vec::with_capacity(0));
-        for _ in 0..1000 {
-            for j in arrs.iter_mut() {
-                j.push(0u64);
-            }
-        }
-        let mut c = 0u64;
-        b.iter(move || {
-            for i in 0..100 {
-                for j in arrs.iter() {
-                    c += unsafe { j.get_unchecked(i) };
-                }
-            }
-        });
-        assert_eq!(c, 0);
     }
 }
