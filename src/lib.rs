@@ -1,12 +1,13 @@
 //! 自动扩展槽位的对象槽。
-//! 由多个固定槽构成，每个固定槽用不扩容的Vec来装元素。
-//! 当槽位上的Vec长度不够时，不会扩容Vec，而是线程安全的到下一个槽位分配新Vec。
-//! 第一个固定槽位的Vec长度为32。
-//! 固定槽迭代性能比Vec慢1-10倍， 主要损失在切换bucket时，原子操作及缓存失效。
+//! 由多个固定槽构成，每个固定槽用不扩容的数组来装元素。
+//! 当槽位上的数组长度不够时，不会扩容，而是线程安全的到下一个槽位分配新数组。
+//! 第一个固定槽位的数组长度为32。
+//! 迭代跳过未分配的槽；已分配的槽包含所有默认初始化的元素。
 
-use std::mem::{forget, replace, transmute, ManuallyDrop};
+use std::marker::PhantomData;
+use std::mem::replace;
 use std::ops::{Index, IndexMut, Range};
-use std::ptr::{null, null_mut};
+use std::ptr::{self, null_mut, NonNull};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Mutex;
 
@@ -14,37 +15,21 @@ use std::sync::Mutex;
 // this also reduces the maximum capacity of a arr.
 pub const SKIP: usize = 32;
 pub const SKIP_BUCKET: usize = ((usize::BITS - SKIP.leading_zeros()) as usize) - 1;
-
 pub const BUCKETS: usize = (u32::BITS as usize) - SKIP_BUCKET;
+/// Maximum valid index, not a length. The exclusive range bound is MAX_ENTRIES + 1.
 pub const MAX_ENTRIES: usize = (u32::MAX as usize) - SKIP;
 
-/// Creates a [`Buckets`] containing the given elements.
-///
-/// `buckets!` allows `Buckets`s to be defined with the same syntax as array expressions.
-/// There are two forms of this macro:
-///
-/// - Create a [`Buckets`] containing a given list of elements:
-///
+/// Creates default-initialized buckets, then replaces the listed entries.
+/// Remaining entries of allocated buckets retain their default values.
 /// ```
 /// let arr = pi_buckets::buckets![1, 2, 3];
-/// assert_eq!(arr[0], 1);
 /// assert_eq!(arr[1], 2);
-/// assert_eq!(arr[2], 3);
-/// ```
-///
-/// - Create a [`Buckets`] from a given element and size:
-///
-/// ```
-/// let arr = pi_buckets::buckets![1; 3];
-/// assert_eq!(arr[0], 1);
-/// assert_eq!(arr[1], 1);
-/// assert_eq!(arr[2], 1);
+/// let repeated = pi_buckets::buckets![7; 3];
+/// assert_eq!(repeated[2], 7);
 /// ```
 #[macro_export]
 macro_rules! buckets {
-    () => {
-        $crate::Buckets::new()
-    };
+    () => { $crate::Buckets::new() };
     ($elem:expr; $n:expr) => {{
         let mut arr = $crate::Buckets::with_capacity($n);
         arr.extend(::core::iter::repeat($elem).take($n));
@@ -55,15 +40,9 @@ macro_rules! buckets {
     );
 }
 
-/// A lock-free, auto-expansion buckets.
-///
-/// See [the crate documentation](crate) for details.
-///
-/// # Notes
-///
-/// The bucket array is stored inline, meaning that the
-/// `Buckets<T>` is quite large. It is expected that you
-/// store it behind an [`Arc`](std::sync::Arc) or similar.
+/// Stable-address, default-initialized buckets. First allocation uses a mutex;
+/// readers acquire the fully initialized allocation without locking.
+/// Shared reads may coexist with allocation, but not unsafe writes to their entries.
 pub struct Buckets<T> {
     buckets: [AtomicPtr<T>; BUCKETS],
     lock: Mutex<()>,
@@ -71,860 +50,650 @@ pub struct Buckets<T> {
 
 impl<T> Default for Buckets<T> {
     fn default() -> Self {
-        let buckets = [null_mut(); BUCKETS];
-        Buckets {
-            buckets: buckets.map(AtomicPtr::new),
-            lock: Mutex::default(),
+        Self {
+            buckets: [null_mut(); BUCKETS].map(AtomicPtr::new),
+            lock: Mutex::new(()),
         }
     }
 }
 
+// Ownership transfers all allocated T values to the receiving thread.
 unsafe impl<T: Send> Send for Buckets<T> {}
-unsafe impl<T: Sync> Sync for Buckets<T> {}
+// Shared allocation can initialize on one thread and destroy on another;
+// shared references also expose T to readers.
+unsafe impl<T: Send + Sync> Sync for Buckets<T> {}
+
+impl<T> Buckets<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn get(&self, location: &Location) -> Option<&T> {
+        // 安全：Location 的私有桶索引已由构造函数验证。
+        let ptr = unsafe { self.buckets.get_unchecked(location.bucket) }.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+        // Location is validated; publication initializes the entire allocation.
+        Some(unsafe { &*ptr.add(location.entry) })
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, location: &Location) -> Option<&mut T> {
+        // 安全：Location 保证桶索引有效，self 为独占借用。
+        let ptr = *unsafe { self.buckets.get_unchecked_mut(location.bucket) }.get_mut();
+        if ptr.is_null() {
+            return None;
+        }
+        // Exclusive self borrow excludes all other access to this allocation.
+        Some(unsafe { &mut *ptr.add(location.entry) })
+    }
+
+    /// # Safety
+    /// The location's bucket must be allocated. No conflicting unsafe access may
+    /// occur for the lifetime of the returned reference, which is tied to self.
+    #[inline]
+    pub unsafe fn get_unchecked(&self, location: &Location) -> &T {
+        unsafe { &*self.entries(location.bucket).add(location.entry) }
+    }
+
+    /// # Safety
+    /// The location's bucket must be allocated.
+    #[inline]
+    pub unsafe fn get_unchecked_mut(&mut self, location: &Location) -> &mut T {
+        // 安全：Location 保证桶索引有效，self 为独占借用。
+        let ptr = *unsafe { self.buckets.get_unchecked_mut(location.bucket) }.get_mut();
+        // 安全：调用方保证桶已分配，Location 保证元素在桶内。
+        unsafe { &mut *ptr.add(location.entry) }
+    }
+
+    /// Shared-reference mutable access. Prefer get_mut with exclusive ownership.
+    ///
+    /// # Safety
+    /// The selected element must have no live shared or mutable references and
+    /// no concurrent accesses until the returned borrow ends. The allocation
+    /// must remain owned by self for that lifetime. Synchronize across threads;
+    /// different entries may be accessed independently, but slices/iterators can
+    /// borrow many entries at once.
+    /// ```
+    /// use pi_buckets::{Buckets, Location};
+    /// let arr = Buckets::<usize>::with_capacity(1);
+    /// unsafe { *arr.load(&Location::of(0)).unwrap() = 4; }
+    /// assert_eq!(arr[0], 4);
+    /// ```
+    #[allow(clippy::mut_from_ref)] // 调用方通过 unsafe 契约保证元素独占访问。
+    #[inline]
+    pub unsafe fn load(&self, location: &Location) -> Option<&mut T> {
+        // 安全：Location 的私有桶索引已由构造函数验证。
+        let ptr = unsafe { self.buckets.get_unchecked(location.bucket) }.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+        // Caller guarantees exclusive access to the selected element.
+        Some(unsafe { &mut *ptr.add(location.entry) })
+    }
+
+    /// # Safety
+    /// The bucket must be allocated and all aliasing, lifetime and thread
+    /// requirements of load apply.
+    #[allow(clippy::mut_from_ref)] // 与 load 相同的元素独占访问契约。
+    #[inline]
+    pub unsafe fn load_unchecked(&self, location: &Location) -> &mut T {
+        unsafe { &mut *self.entries(location.bucket).add(location.entry) }
+    }
+
+    /// Transfer all allocations out of self. Existing borrows exclude this call.
+    pub fn take(&mut self) -> [Vec<T>; BUCKETS] {
+        let mut result = std::array::from_fn(|_| Vec::new());
+        for (i, bucket) in self.buckets.iter_mut().enumerate() {
+            let ptr = replace(bucket.get_mut(), null_mut());
+            if !ptr.is_null() {
+                // Exclusive ownership, exact boxed-slice layout, detached once.
+                result[i] = unsafe { to_bucket_vec(ptr, i) };
+            }
+        }
+        result
+    }
+
+    pub fn iter(&self) -> BucketIter<'_, T> {
+        self.slice(0..MAX_ENTRIES + 1)
+    }
+
+    /// Iterate allocated entries in a validated half-open range, skipping gaps.
+    /// ```
+    /// let arr = pi_buckets::buckets![1, 2, 4];
+    /// assert_eq!(arr.slice(1..3).copied().collect::<Vec<_>>(), [2, 4]);
+    /// ```
+    pub fn slice(&self, range: Range<usize>) -> BucketIter<'_, T> {
+        BucketIter::with_prefix(&[], self, range)
+    }
+
+    /// Bucket-only iteration using absolute indices after an external prefix.
+    /// The range must start at or after capacity; no prefix is read.
+    pub fn slice_row(&self, range: Range<usize>, capacity: usize) -> BucketIter<'_, T> {
+        assert!(
+            range.start >= capacity,
+            "range starts inside omitted prefix"
+        );
+        BucketIter {
+            cursor: SegmentCursor::new(
+                NonNull::dangling().as_ptr(),
+                capacity,
+                Some(&self.buckets),
+                range,
+            ),
+        }
+    }
+
+    /// Yield contiguous slices, clipped to the range, skipping unallocated gaps.
+    pub fn segments(&self, range: Range<usize>) -> BucketSegments<'_, T> {
+        BucketSegments {
+            cursor: self.slice(range).cursor,
+        }
+    }
+
+    pub fn iter_mut(&mut self) -> BucketIterMut<'_, T> {
+        self.slice_mut(0..MAX_ENTRIES + 1)
+    }
+
+    pub fn slice_mut(&mut self, range: Range<usize>) -> BucketIterMut<'_, T> {
+        // The exclusive self borrow lasts for the returned iterator's lifetime.
+        BucketIterMut {
+            cursor: SegmentCursor::new(NonNull::dangling().as_ptr(), 0, Some(&self.buckets), range),
+            exclusive: PhantomData,
+        }
+    }
+
+    pub fn segments_mut(&mut self, range: Range<usize>) -> BucketSegmentsMut<'_, T> {
+        BucketSegmentsMut {
+            cursor: self.slice_mut(range).cursor,
+            exclusive: PhantomData,
+        }
+    }
+
+    /// # Safety
+    /// bucket must be less than BUCKETS. The pointer is borrowed, may be null,
+    /// and must not be freed. Dereferencing requires initialized, in-bounds
+    /// access and the usual aliasing/thread rules; self must remain alive.
+    #[inline]
+    pub unsafe fn entries(&self, bucket: usize) -> *mut T {
+        // 安全：调用方按契约保证 bucket 小于 BUCKETS。
+        unsafe { self.buckets.get_unchecked(bucket) }.load(Ordering::Acquire)
+    }
+
+    /// # Safety
+    /// All requirements of entries apply.
+    pub unsafe fn load_entries(&self, bucket: usize) -> *mut T {
+        unsafe { self.entries(bucket) }
+    }
+
+    /// # Safety
+    /// bucket must be in bounds. The pointer must not outlive self or be freed;
+    /// any access must respect the exclusive borrow and initialized bounds.
+    #[inline]
+    pub unsafe fn entries_mut(&mut self, bucket: usize) -> *mut T {
+        // 安全：调用方保证桶索引有效，self 为独占借用。
+        *unsafe { self.buckets.get_unchecked_mut(bucket) }.get_mut()
+    }
+
+    // The raw atomic pointer table is deliberately not exposed: replacing a
+    // published allocation would invalidate safe references and ownership.
+}
 
 impl<T: Default> Buckets<T> {
-    /// Constructs a new, empty `Buckets<T>`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use crate::pi_buckets;
-    /// let arr: pi_buckets::Buckets<i32> = pi_buckets::Buckets::new();
-    /// ```
-    #[inline]
-    pub fn new() -> Buckets<T> {
-        Buckets::default()
-    }
-
-    /// Constructs a new, empty `Buckets<T>` with the specified capacity.
-    ///
-    /// Capacity will be aligned to a power of 2 size.
-    /// The array will be able to hold at least `capacity` elements
-    /// without reallocating.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use crate::{pi_buckets, pi_buckets::Location};
-    /// let mut arr = pi_buckets::Buckets::with_capacity(10);
-    ///
-    /// for i in 0..32 {
-    ///     // will not allocate
-    ///     arr.set(&Location::of(i), i);
-    /// }
-    ///
-    /// // may allocate
-    /// arr.set(&Location::of(33), 33);
-    /// ```
-    #[inline(always)]
-    pub fn with_capacity(capacity: usize) -> Buckets<T> {
-        let mut buckets = [null_mut(); BUCKETS];
-        if capacity == 0 {
-            return Buckets {
-                buckets: buckets.map(AtomicPtr::new),
-                lock: Mutex::default(),
-            };
+    /// Allocates enough whole buckets for capacity entries, not capacity + 1.
+    /// Previously installed buckets are owned by the result during unwinding.
+    pub fn with_capacity(capacity: usize) -> Self {
+        assert!(capacity <= MAX_ENTRIES + 1, "exceeded maximum length");
+        let mut result = Self::new();
+        if capacity != 0 {
+            for bucket in 0..=Location::bucket(capacity - 1) {
+                *result.buckets[bucket].get_mut() = bucket_alloc(Location::bucket_len(bucket));
+            }
         }
-        let end = Location::of(capacity).bucket as usize;
-        for (i, bucket) in buckets[..=end].iter_mut().enumerate() {
-            let len = Location::bucket_len(i);
-            *bucket = bucket_alloc(len);
-        }
-
-        Buckets {
-            buckets: buckets.map(AtomicPtr::new),
-            lock: Mutex::default(),
-        }
+        result
     }
 
-    /// Returns a reference to the element at the given index.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use crate::{pi_buckets, pi_buckets::Location};
-    /// let arr = pi_buckets::buckets![10, 40, 30];
-    /// assert_eq!(Some(&40), arr.get(&Location::of(1)));
-    /// assert_eq!(None, arr.get(&Location::of(33)));
-    /// ```
-    #[inline(always)]
-    pub fn get(&self, location: &Location) -> Option<&T> {
-        // safety: `location.bucket` is always in bounds
-        let entries = unsafe { self.entries(location.bucket as usize) };
-
-        // bucket is uninitialized
-        if entries.is_null() {
-            return None;
-        }
-
-        // safety: `location.entry` is always in bounds for it's bucket
-        Some(unsafe { &*entries.add(location.entry) })
-    }
-
-    /// Returns a reference to an element, without doing bounds
-    /// checking or verifying that the element is fully initialized.
-    ///
-    /// # Safety
-    ///
-    /// Calling this method with an out-of-bounds index, or for an element that
-    /// is being concurrently initialized is **undefined behavior**, even if
-    /// the resulting reference is not used.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use crate::{pi_buckets, pi_buckets::Location};
-    /// let arr = pi_buckets::buckets![1, 2, 4];
-    ///
-    /// unsafe {
-    ///     assert_eq!(arr.get_unchecked(&Location::of(1)), &2);
-    /// }
-    /// ```
-    #[inline(always)]
-    pub unsafe fn get_unchecked(&self, location: &Location) -> &T {
-        &*self.entries(location.bucket as usize).add(location.entry)
-    }
-
-    /// Returns a mutable reference to the element at the given index.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use crate::{pi_buckets, pi_buckets::Location};
-    /// let mut arr = pi_buckets::buckets![10, 40, 30];
-    /// assert_eq!(Some(&mut 40), arr.get_mut(&Location::of(1)));
-    /// assert_eq!(None, arr.get_mut(&Location::of(33)));
-    /// ```
-    #[inline(always)]
-    pub fn get_mut(&mut self, location: &Location) -> Option<&mut T> {
-        let entries = unsafe { self.entries(location.bucket as usize) };
-
-        // bucket is uninitialized
-        if entries.is_null() {
-            return None;
-        }
-
-        // safety: `location.entry` is always in bounds for it's bucket
-        Some(unsafe { &mut *entries.add(location.entry) })
-    }
-
-    /// Returns a mutable reference to an element, without doing bounds
-    /// checking or verifying that the element is fully initialized.
-    ///
-    /// # Safety
-    ///
-    /// Calling this method with an out-of-bounds index is **undefined
-    /// behavior**, even if the resulting reference is not used.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use crate::{pi_buckets, pi_buckets::Location};
-    /// let mut arr = pi_buckets::buckets![1, 2, 4];
-    ///
-    /// unsafe {
-    ///     assert_eq!(arr.get_unchecked_mut(&Location::of(1)), &mut 2);
-    /// }
-    /// ```
-    #[inline(always)]
-    pub unsafe fn get_unchecked_mut(&mut self, location: &Location) -> &mut T {
-        &mut *self.entries(location.bucket as usize).add(location.entry)
-    }
-    /// Returns a mutable reference to the element at the given index.
-    /// If the bucket corresponding to the index is not allocated,
-    /// it will be allocated automatically, and the returned T is null
-    ///
-    /// # Examples
-    ///
-    /// ```
-    ///
-    /// use crate::{pi_buckets, pi_buckets::Location};
-    /// let mut arr = pi_buckets::buckets![10, 40, 30];
-    /// assert_eq!(40, *arr.alloc(&Location::of(1)));
-    /// assert_eq!(0, *arr.alloc(&Location::of(3)));
-    /// ```
-    #[inline(always)]
     pub fn alloc(&mut self, location: &Location) -> &mut T {
-        let entries = self.alloc_bucket(location);
-        // safety: `location.entry` is always in bounds for it's bucket
-        unsafe { &mut *entries.add(location.entry) }
+        let ptr = self.alloc_bucket(location);
+        // Exclusive self borrow and validated location.
+        unsafe { &mut *ptr.add(location.entry) }
     }
-    /// set element at the given index.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    ///
-    /// use crate::{pi_buckets, pi_buckets::Location};
-    /// let mut arr = crate::pi_buckets::buckets![10, 40, 30];
-    /// assert_eq!(40, arr.set(&Location::of(1), 20));
-    /// assert_eq!(Some(&20), arr.get(&Location::of(1)));
-    /// assert_eq!(0, arr.set(&Location::of(33), 5));
-    /// assert_eq!(Some(&5), arr.get(&Location::of(33)));
-    /// ```
-    #[inline(always)]
+
     pub fn set(&mut self, location: &Location, value: T) -> T {
         replace(self.alloc(location), value)
     }
 
-    /// Returns a mutable reference to the element at the given index.
-    /// If the bucket corresponding to the index is not allocated,
-    /// it will not be allocated automatically, and the returned None.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    ///
-    /// use crate::{pi_buckets, pi_buckets::Location};
-    /// let arr = pi_buckets::buckets![10, 40, 30];
-    /// assert_eq!(10, *arr.load(&Location::of(0)).unwrap());
-    /// assert_eq!(Some(&mut 40), arr.load(&Location::of(1)));
-    /// assert_eq!(0, *arr.load(&Location::of(3)).unwrap());
-    /// assert_eq!(None, arr.load(&Location::of(33)));
-    /// ```
-    #[inline(always)]
-    pub fn load(&self, location: &Location) -> Option<&mut T> {
-        let entries = unsafe { self.load_entries(location.bucket as usize) };
-
-        // bucket is uninitialized
-        if entries.is_null() {
-            return None;
-        }
-
-        // safety: `location.entry` is always in bounds for it's bucket
-        Some(unsafe { &mut *entries.add(location.entry) })
-    }
-
-    /// Returns a mutable reference to an element, without doing bounds
-    /// checking or verifying that the element is fully initialized.
-    ///
     /// # Safety
-    ///
-    /// Calling this method with an out-of-bounds index is **undefined
-    /// behavior**, even if the resulting reference is not used.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use crate::{pi_buckets, pi_buckets::Location};
-    /// let arr = pi_buckets::buckets![1, 2, 4];
-    ///
-    /// unsafe {
-    ///     assert_eq!(arr.load_unchecked(&Location::of(1)), &mut 2);
-    /// }
-    /// ```
-    #[inline(always)]
-    pub unsafe fn load_unchecked(&self, location: &Location) -> &mut T {
-        &mut *self
-            .load_entries(location.bucket as usize)
-            .add(location.entry)
+    /// All aliasing, lifetime and thread requirements of load apply. Allocation
+    /// initializes the whole bucket; readers must not observe conflicting writes.
+    #[allow(clippy::mut_from_ref)] // 分配不替代调用方的元素独占访问保证。
+    pub unsafe fn load_alloc(&self, location: &Location) -> &mut T {
+        let ptr = self.load_alloc_bucket(location);
+        unsafe { &mut *ptr.add(location.entry) }
     }
 
-    /// Returns a mutable reference to the element at the given index.
-    /// If the bucket corresponding to the index is not allocated,
-    /// it will be allocated automatically, and the returned T is null
-    /// # Examples
-    ///
+    /// # Safety
+    /// No other access or reference to the selected element may overlap this
+    /// replacement (including destruction of the old value). Synchronize across
+    /// threads and obey load's lifetime/aliasing requirements.
     /// ```
-    ///
-    /// use crate::{pi_buckets, pi_buckets::Location};
-    /// let arr = pi_buckets::buckets![10, 40, 30];
-    /// assert_eq!(40, *arr.load_alloc(&Location::of(1)));
-    /// assert_eq!(0, *arr.load_alloc(&Location::of(3)));
-    /// ```
-    #[inline(always)]
-    pub fn load_alloc(&self, location: &Location) -> &mut T {
-        let entries = self.load_alloc_bucket(location);
-        // safety: `location.entry` is always in bounds for it's bucket
-        unsafe { transmute(entries.add(location.entry)) }
-    }
-    /// insert an element at the given index.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use crate::{pi_buckets, pi_buckets::Location};
     /// let arr = pi_buckets::buckets![1, 2];
-    /// arr.insert(&Location::of(2), 3);
-    /// assert_eq!(arr[0], 1);
-    /// assert_eq!(arr[1], 2);
+    /// unsafe { arr.insert(&pi_buckets::Location::of(2), 3); }
     /// assert_eq!(arr[2], 3);
     /// ```
-    #[inline(always)]
-    pub fn insert(&self, location: &Location, value: T) -> T {
-        replace(self.load_alloc(location), value)
-    }
-    /// take buckets.
-    pub fn take(&self) -> [Vec<T>; BUCKETS] {
-        let mut buckets = [0; BUCKETS].map(|_| Vec::new());
-        for (i, p) in self.buckets.iter().enumerate() {
-            let ptr = p.swap(null_mut(), Ordering::Relaxed);
-            if ptr.is_null() {
-                continue;
-            }
-            buckets[i] = to_bucket_vec(ptr, i);
-        }
-        buckets
+    pub unsafe fn insert(&self, location: &Location, value: T) -> T {
+        unsafe { replace(self.load_alloc(location), value) }
     }
 
-    /// Returns an iterator over the array.
-    ///
-    /// Values are yielded in the form `Entry`. The array may
-    /// have in-progress concurrent writes that create gaps, so `index`
-    /// may not be strictly sequential.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    ///
-    /// use crate::{pi_buckets, pi_buckets::Location};
-    /// let arr = pi_buckets::buckets![1, 2, 4];
-    /// arr.insert(&Location::of(98), 98);
-    /// let mut iterator = arr.iter();
-    /// assert_eq!(iterator.size_hint().0, 32);
-    /// let r = iterator.next().unwrap();
-    /// assert_eq!((iterator.index() - 1, *r), (0, 1));
-    /// let r = iterator.next().unwrap();
-    /// assert_eq!((iterator.index() - 1, *r), (1, 2));
-    /// let r = iterator.next().unwrap();
-    /// assert_eq!((iterator.index() - 1, *r), (2, 4));
-    /// for i in 3..32 {
-    ///     let r = iterator.next().unwrap();
-    ///     assert_eq!((iterator.index() - 1, *r), (i, 0));
-    /// }
-    /// for i in 96..98 {
-    ///     let r = iterator.next().unwrap();
-    ///     assert_eq!((iterator.index() - 1, *r), (i, 0));
-    /// }
-    /// let r = iterator.next().unwrap();
-    /// assert_eq!((iterator.index() - 1, *r), (98, 98));
-    /// for i in 99..224 {
-    ///     let r = iterator.next().unwrap();
-    ///     assert_eq!((iterator.index() - 1, *r), (i, 0));
-    /// }
-    /// assert_eq!(iterator.next(), None);
-    /// assert_eq!(iterator.size_hint().0, 0);
-    /// ```
-    #[inline(always)]
-    pub fn iter(&self) -> BucketIter<'_, T> {
-        self.slice_row(0..MAX_ENTRIES, 0)
-    }
-
-    /// Returns an iterator over the array at the given range.
-    ///
-    /// Values are yielded in the form `Entry`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let arr = crate::pi_buckets::buckets![1, 2, 4, 6];
-    /// let mut iterator = arr.slice(1..3);
-    ///
-    /// let r = iterator.next().unwrap();
-    /// assert_eq!(*r, 2);
-    /// let r = iterator.next().unwrap();
-    /// assert_eq!(*r, 4);
-    /// assert_eq!(iterator.next(), None);
-    /// ```
-    #[inline(always)]
-    pub fn slice(&self, range: Range<usize>) -> BucketIter<'_, T> {
-        self.slice_row(range, 0)
-    }
-    pub fn slice_row(&self, range: Range<usize>, capacity: usize) -> BucketIter<'_, T> {
-        let start = Location::of(range.start - capacity);
-        let end = Location::of(range.end - capacity);
-        BucketIter::new(null_mut(), start, end.entry, end.bucket, &self, capacity).init_iter()
-    }
-
-    #[inline(always)]
-    pub unsafe fn load_entries(&self, bucket: usize) -> *mut T {
-        self.buckets.get_unchecked(bucket).load(Ordering::Acquire)
-    }
-    #[inline(always)]
-    pub unsafe fn entries(&self, bucket: usize) -> *mut T {
-        self.buckets.get_unchecked(bucket).load(Ordering::Acquire)
-    }
-    #[inline(always)]
-    pub unsafe fn entries_mut(&mut self, bucket: usize) -> *mut T {
-        *self.buckets.get_unchecked_mut(bucket).get_mut()
-    }
-    #[inline(always)]
+    /// Return a borrowed raw pointer to a fully initialized, stable allocation.
+    /// Safe to request concurrently. Dereferencing is unsafe: the caller must
+    /// respect bounds, self's lifetime, aliases and synchronization, and must
+    /// never free this allocation. The length is derived from location's bucket.
     pub fn load_alloc_bucket(&self, location: &Location) -> *mut T {
-        let bucket = unsafe { self.buckets.get_unchecked(location.bucket as usize) };
-        // safety: `location.bucket` is always in bounds
-        let mut entries = bucket.load(Ordering::Acquire);
-        // bucket is uninitialized
-        if entries.is_null() {
-            entries = bucket_init(bucket, location.len, &self.lock)
+        // 安全：Location 的私有桶索引已由构造函数验证。
+        let bucket = unsafe { self.buckets.get_unchecked(location.bucket) };
+        let mut ptr = bucket.load(Ordering::Acquire);
+        if ptr.is_null() {
+            // A default constructor can panic before publication. Recover poison
+            // explicitly while retaining the guard for the whole initialization.
+            let _guard = self
+                .lock
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            ptr = bucket.load(Ordering::Acquire);
+            if ptr.is_null() {
+                ptr = bucket_alloc(location.len());
+                bucket.store(ptr, Ordering::Release);
+            }
         }
-        entries
+        ptr
     }
-    #[inline(always)]
+
     pub fn alloc_bucket(&mut self, location: &Location) -> *mut T {
-        let bucket = unsafe { self.buckets.get_unchecked_mut(location.bucket as usize) };
-        // safety: `location.bucket` is always in bounds
-        let mut entries = *bucket.get_mut();
-
-        // bucket is uninitialized
-        if entries.is_null() {
-            entries = bucket_init(bucket, location.len, &self.lock);
-        }
-        entries
-    }
-    #[inline(always)]
-    pub fn buckets(&self) -> &[AtomicPtr<T>] {
-        &self.buckets
+        self.load_alloc_bucket(location)
     }
 }
 
-impl<T: Default> Index<usize> for Buckets<T> {
+impl<T> Index<usize> for Buckets<T> {
     type Output = T;
-    #[inline(always)]
-    fn index(&self, index: usize) -> &Self::Output {
+    fn index(&self, index: usize) -> &T {
         self.get(&Location::of(index))
-            .expect("no element found at index {index}")
+            .expect("bucket not allocated")
     }
 }
-
-impl<T: Default> IndexMut<usize> for Buckets<T> {
-    #[inline(always)]
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+impl<T> IndexMut<usize> for Buckets<T> {
+    fn index_mut(&mut self, index: usize) -> &mut T {
         self.get_mut(&Location::of(index))
-            .expect("no element found at index_mut {index}")
+            .expect("bucket not allocated")
     }
 }
 impl<T> Drop for Buckets<T> {
     fn drop(&mut self) {
         for (i, bucket) in self.buckets.iter_mut().enumerate() {
             let ptr = *bucket.get_mut();
-            if ptr.is_null() {
-                continue;
+            if !ptr.is_null() {
+                // Self owns each exact-sized boxed slice, with no live borrows.
+                unsafe {
+                    drop(Box::from_raw(ptr::slice_from_raw_parts_mut(
+                        ptr,
+                        Location::bucket_len(i),
+                    )))
+                };
             }
-            // safety: in drop
-            to_bucket_vec(ptr, i);
         }
     }
 }
-
 impl<T: Default> FromIterator<T> for Buckets<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let iter = iter.into_iter();
-
-        let (lower, _) = iter.size_hint();
-        let mut arr = Buckets::with_capacity(lower);
-        for (i, value) in iter.enumerate() {
-            arr.set(&Location::of(i), value);
-        }
-        arr
+        let mut result = Self::with_capacity(iter.size_hint().0);
+        result.extend(iter);
+        result
     }
 }
-
 impl<T: Default> Extend<T> for Buckets<T> {
+    /// Replaces entries starting at index zero (there is no logical length).
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        let iter = iter.into_iter();
-        for (i, value) in iter.enumerate() {
+        for (i, value) in iter.into_iter().enumerate() {
             self.set(&Location::of(i), value);
         }
     }
 }
-
-impl<T: Default + Clone> Clone for Buckets<T> {
-    fn clone(&self) -> Buckets<T> {
-        let mut buckets: [*mut T; BUCKETS] = [null_mut(); BUCKETS];
-
-        for (i, bucket) in buckets.iter_mut().enumerate() {
-            let ptr = unsafe { self.load_entries(i) };
-            if ptr.is_null() {
-                continue;
+impl<T: Clone> Clone for Buckets<T> {
+    fn clone(&self) -> Self {
+        let mut result = Self::new();
+        for (i, bucket) in self.buckets.iter().enumerate() {
+            let ptr = bucket.load(Ordering::Acquire);
+            if !ptr.is_null() {
+                // Borrow source, never reconstruct source ownership. Both the
+                // partial clone and installed target buckets have RAII owners.
+                let source = unsafe { std::slice::from_raw_parts(ptr, Location::bucket_len(i)) };
+                let target = source.to_vec().into_boxed_slice();
+                *result.buckets[i].get_mut() = Box::into_raw(target).cast::<T>();
             }
-            let vec = to_bucket_vec(ptr, i);
-            *bucket = ManuallyDrop::new(vec.clone()).as_mut_ptr();
-            forget(vec);
         }
-        Buckets {
-            buckets: buckets.map(AtomicPtr::new),
-            lock: Mutex::default(),
-        }
+        result
     }
 }
 
-/// An iterator over the elements of a [`Buckets<T>`].
-///
-/// See [`Buckets::iter`] for details.
-pub struct BucketIter<'a, T> {
-    ptr: *mut T,
-    start: Location,
-    end_entry: usize,
-    end_bucket: isize,
-    buckets: &'a Buckets<T>,
-    capacity: usize,
+/// Allocates exactly len default-initialized entries using a boxed-slice layout.
+/// The caller owns the returned allocation and must eventually reconstruct
+/// Box<[T]> with exactly len entries (or Vec with length/capacity len for non-ZST).
+/// Default panics destroy any already initialized entries.
+pub fn bucket_alloc<T: Default>(len: usize) -> *mut T {
+    let entries: Box<[T]> = std::iter::repeat_with(T::default).take(len).collect();
+    Box::into_raw(entries).cast::<T>()
 }
 
-impl<'a, T> BucketIter<'a, T> {
-    #[inline(always)]
-    pub fn empty() -> Self {
-        BucketIter {
-            ptr: null_mut(),
-            start: Location::default(),
-            end_entry: 0,
-            end_bucket: 0,
-            buckets: unsafe { transmute(null::<[AtomicPtr<T>; BUCKETS]>()) },
-            capacity: 0,
-        }
-    }
-    #[inline(always)]
-    pub fn new(
-        ptr: *mut T,
-        start: Location,
-        end_entry: usize,
-        end_bucket: isize,
-        buckets: &'a Buckets<T>,
-        capacity: usize,
-    ) -> Self {
-        BucketIter {
+unsafe fn to_bucket_vec<T>(ptr: *mut T, bucket: usize) -> Vec<T> {
+    // Only detached allocations owned by Buckets reach this conversion.
+    unsafe {
+        Box::from_raw(ptr::slice_from_raw_parts_mut(
             ptr,
-            start,
-            end_entry,
-            end_bucket,
-            buckets,
-            capacity,
-        }
+            Location::bucket_len(bucket),
+        ))
+        .into_vec()
     }
-    #[inline(always)]
-    fn init_iter(mut self) -> Self {
-        if self.start.bucket > self.end_bucket {
-            self.start.len = self.start.entry;
-            return self;
-        }
-        if self.start.bucket == self.end_bucket {
-            self.start.len = self.end_entry;
-            if self.start.len == 0 {
-                return self;
-            }
-        }
-        self.load_ptr();
-        if self.ptr.is_null() {
-            self.start.len = self.start.entry;
-        }
-        self
+}
+
+/// A validated element address, never an iterator sentinel or one-past position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Location {
+    bucket: usize,
+    entry: usize,
+    len: usize,
+}
+impl Default for Location {
+    #[inline]
+    fn default() -> Self {
+        Self::new(0, 0)
     }
-    #[inline(always)]
-    pub fn index(&self) -> usize {
-        self.start.index(self.capacity)
-    }
-    #[inline(always)]
-    pub(crate) fn get(&mut self) -> &'a mut T {
-        unsafe { transmute(self.ptr.add(self.start.entry)) }
-    }
-    #[inline(always)]
-    fn load_ptr(&mut self) {
-        self.ptr = unsafe {
-            self.buckets
-                .buckets
-                .get_unchecked(self.start.bucket as usize)
-                .load(Ordering::Relaxed)
-        };
+}
+impl Location {
+    /// Validates the bucket and entry, caching the derived bucket length.
+    #[inline]
+    pub const fn new(bucket: usize, entry: usize) -> Self {
+        let len = Self::bucket_len(bucket);
+        assert!(entry < len, "invalid entry");
+        Self { bucket, entry, len }
     }
     #[inline]
-    pub(crate) fn next_bucket(&mut self) -> Option<&'a mut T> {
-        loop {
-            if self.start.bucket >= self.end_bucket {
-                return None;
-            }
-            self.start.bucket += 1;
-            self.load_ptr();
-            if self.ptr.is_null() {
-                continue;
-            }
-            if self.start.bucket == self.end_bucket {
-                if self.end_entry == 0 {
-                    return None;
-                }
-                self.start.len = self.end_entry;
-            } else {
-                self.start.len = Location::bucket_len(self.start.bucket as usize);
-            }
-            self.start.entry = 1;
-            return Some(unsafe { transmute(self.ptr) });
+    pub const fn of(index: usize) -> Self {
+        assert!(index <= MAX_ENTRIES, "exceeded maximum index");
+        let skipped = index + SKIP;
+        let bucket = (usize::BITS - skipped.leading_zeros()) as usize - SKIP_BUCKET - 1;
+        let len = Self::bucket_len(bucket);
+        Self {
+            bucket,
+            entry: skipped - len,
+            len,
         }
     }
-    fn size(&self) -> (usize, Option<usize>) {
-        if self.start.bucket > self.end_bucket {
-            return (0, Some(0));
+    pub const fn bucket(index: usize) -> usize {
+        Self::of(index).bucket
+    }
+    #[inline]
+    pub const fn bucket_index(&self) -> usize {
+        self.bucket
+    }
+    #[inline]
+    pub const fn entry(&self) -> usize {
+        self.entry
+    }
+    #[allow(clippy::len_without_is_empty)] // 表示所属桶容量，不是 Location 集合长度。
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+    pub const fn bucket_len(bucket: usize) -> usize {
+        assert!(bucket < BUCKETS, "invalid bucket");
+        1usize << (bucket + SKIP_BUCKET)
+    }
+    pub const fn bucket_capacity(bucket: usize) -> usize {
+        // Subtract before adding: the last bucket's power-of-two end would
+        // overflow usize on 32-bit, although its actual capacity is representable.
+        let len = Self::bucket_len(bucket);
+        (len - SKIP) + len
+    }
+    #[inline]
+    pub const fn index(&self, capacity: usize) -> usize {
+        let index = self.len - SKIP + self.entry;
+        match capacity.checked_add(index) {
+            Some(index) => index,
+            None => panic!("index overflow"),
         }
-        // 最小为起始槽的entry数量
-        let min = self.start.len.saturating_sub(self.start.entry);
-        // println!("size: {:?}", (min, self.start.len, self.start.entry));
-        let c = self.end_bucket - self.start.bucket;
-        if c == 0 {
-            return (min, Some(min));
-        }
-        if c == 1 {
-            return (min, Some(min + self.end_entry));
-        }
-        if self.start.bucket < 0 {
-            let end = Location::new(c - 1, 0, self.end_entry);
-            return (min, Some(min + end.index(0)));
-        }
-        // 中间槽的entry数量
-        let n = self.start.len * (1 << (c - 1));
-        (min, Some(min + n + self.end_entry))
     }
 }
 
+// Iterator position is separate from Location. Each selected segment uses the
+// same pointer + remaining representation, whether prefix or bucket storage.
+struct SegmentCursor<'a, T> {
+    ptr: *mut T,
+    remaining: usize,
+    position: usize,
+    scan: usize,
+    end: usize,
+    prefix: *const T,
+    prefix_len: usize,
+    buckets: Option<&'a [AtomicPtr<T>; BUCKETS]>,
+    lifetime: PhantomData<&'a T>,
+}
+impl<'a, T> SegmentCursor<'a, T> {
+    fn new(
+        prefix: *const T,
+        prefix_len: usize,
+        buckets: Option<&'a [AtomicPtr<T>; BUCKETS]>,
+        range: Range<usize>,
+    ) -> Self {
+        assert!(range.start <= range.end, "reversed range");
+        assert!(
+            range.end.saturating_sub(prefix_len) <= MAX_ENTRIES + 1,
+            "exceeded maximum range"
+        );
+        let mut result = Self {
+            ptr: NonNull::dangling().as_ptr(),
+            remaining: 0,
+            position: range.start,
+            scan: range.start,
+            end: range.end,
+            prefix,
+            prefix_len,
+            buckets,
+            lifetime: PhantomData,
+        };
+        result.advance();
+        result
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn advance(&mut self) -> bool {
+        if self.scan < self.end && self.scan < self.prefix_len {
+            let len = self.end.min(self.prefix_len) - self.scan;
+            // Only safe slice or caller-validated raw prefix constructors can
+            // reach this branch, and the clipped segment is within the prefix.
+            self.ptr = unsafe { self.prefix.add(self.scan) }.cast_mut();
+            self.position = self.scan;
+            self.scan += len;
+            self.remaining = len;
+            return true;
+        }
+        if let Some(buckets) = self.buckets {
+            while self.scan < self.end {
+                let location = Location::of(self.scan - self.prefix_len);
+                let len = (location.len() - location.entry).min(self.end - self.scan);
+                // 安全：Location::of 已验证桶索引，桶表通过共享引用访问。
+                let ptr = unsafe { buckets.get_unchecked(location.bucket) }.load(Ordering::Acquire);
+                self.position = self.scan;
+                self.scan += len;
+                if !ptr.is_null() {
+                    // Validated entry; Acquire observes fully initialized storage.
+                    self.ptr = unsafe { ptr.add(location.entry) };
+                    self.remaining = len;
+                    return true;
+                }
+            }
+        }
+        self.position = self.end;
+        self.scan = self.end;
+        self.remaining = 0;
+        false
+    }
+
+    #[inline(always)]
+    fn next_ptr(&mut self) -> Option<*mut T> {
+        if self.remaining == 0 && !self.advance() {
+            return None;
+        }
+        let ptr = self.ptr;
+        // Current initialized segment has at least one remaining element.
+        self.ptr = unsafe { self.ptr.add(1) };
+        self.remaining -= 1;
+        self.position += 1;
+        Some(ptr)
+    }
+
+    fn next_segment(&mut self) -> Option<(*mut T, usize)> {
+        if self.remaining == 0 && !self.advance() {
+            return None;
+        }
+        let segment = (self.ptr, self.remaining);
+        self.position += self.remaining;
+        self.remaining = 0;
+        Some(segment)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // 最小为当前连续段的entry数量；中间未分配槽只能计入上界。
+        (self.remaining, Some(self.end - self.position))
+    }
+}
+
+/// Shared entry iterator. Gaps are skipped; index() is the next logical position
+/// (after next(), index() - 1 is the yielded entry's index). Not a snapshot:
+/// allocation may become visible before a future bucket is visited.
+pub struct BucketIter<'a, T> {
+    cursor: SegmentCursor<'a, T>,
+}
+impl<'a, T> BucketIter<'a, T> {
+    pub fn empty() -> Self {
+        Self {
+            cursor: SegmentCursor::new(NonNull::dangling().as_ptr(), 0, None, 0..0),
+        }
+    }
+    /// Read an initialized prefix followed by bucket entries at prefix.len().
+    pub fn with_prefix(prefix: &'a [T], buckets: &'a Buckets<T>, range: Range<usize>) -> Self {
+        Self {
+            cursor: SegmentCursor::new(
+                prefix.as_ptr(),
+                prefix.len(),
+                Some(&buckets.buckets),
+                range,
+            ),
+        }
+    }
+    /// Raw-prefix replacement for the former arbitrary-pointer constructor.
+    ///
+    /// # Safety
+    /// If prefix_len is nonzero, prefix must point to prefix_len initialized,
+    /// aligned T values in one allocation, valid for 'a. Their total byte size
+    /// must not exceed isize::MAX. No mutation, deallocation or conflicting
+    /// aliases may occur while any yielded reference lives, including across
+    /// threads. For zero length prefix may be null and is never dereferenced.
+    /// The bucket borrow also lasts for 'a. This does not assume ownership.
+    pub unsafe fn from_raw_prefix(
+        prefix: *const T,
+        prefix_len: usize,
+        buckets: &'a Buckets<T>,
+        range: Range<usize>,
+    ) -> Self {
+        Self {
+            cursor: SegmentCursor::new(prefix, prefix_len, Some(&buckets.buckets), range),
+        }
+    }
+    pub fn index(&self) -> usize {
+        self.cursor.position
+    }
+    pub fn into_segments(self) -> BucketSegments<'a, T> {
+        BucketSegments {
+            cursor: self.cursor,
+        }
+    }
+}
 impl<'a, T> Iterator for BucketIter<'a, T> {
+    type Item = &'a T;
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        // Cursor only visits initialized storage borrowed for 'a.
+        self.cursor.next_ptr().map(|ptr| unsafe { &*ptr })
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.cursor.size_hint()
+    }
+}
+
+pub struct BucketIterMut<'a, T> {
+    cursor: SegmentCursor<'a, T>,
+    exclusive: PhantomData<&'a mut T>,
+}
+impl<T> BucketIterMut<'_, T> {
+    pub fn index(&self) -> usize {
+        self.cursor.position
+    }
+}
+impl<'a, T> Iterator for BucketIterMut<'a, T> {
     type Item = &'a mut T;
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.start.entry < self.start.len {
-            let r = self.get();
-            self.start.entry += 1;
-            return Some(r);
-        }
-        return self.next_bucket();
-        // 将代码内联后， 性能由10ns变为40ns
+        // Exclusive borrow; each entry is visited only once, even across gaps.
+        self.cursor.next_ptr().map(|ptr| unsafe { &mut *ptr })
     }
-    #[inline(always)]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.size()
+        self.cursor.size_hint()
     }
 }
 
-/// take vec.
-#[inline(always)]
-fn to_bucket_vec<T>(ptr: *mut T, bucket: usize) -> Vec<T> {
-    let len = Location::bucket_len(bucket);
-    unsafe { Vec::from_raw_parts(ptr, len, len) }
+pub struct BucketSegments<'a, T> {
+    cursor: SegmentCursor<'a, T>,
 }
-
-pub fn bucket_alloc<T: Default>(len: usize) -> *mut T {
-    let mut entries: Vec<T> = Vec::with_capacity(len);
-    entries.resize_with(entries.capacity(), || T::default());
-    ManuallyDrop::new(entries).as_mut_ptr()
-}
-
-fn bucket_init<T: Default>(share_ptr: &AtomicPtr<T>, len: usize, lock: &Mutex<()>) -> *mut T {
-    let _lock = lock.lock();
-    let mut ptr = share_ptr.load(Ordering::Relaxed);
-    if ptr.is_null() {
-        ptr = bucket_alloc(len);
-        share_ptr.store(ptr, Ordering::Release);
-    }
-    ptr
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct Location {
-    // the length
-    pub len: usize,
-    // the index of the entry in `bucket`
-    pub entry: usize,
-    // the index of the bucket
-    pub bucket: isize,
-}
-
-impl Location {
-    #[inline(always)]
-    pub const fn new(bucket: isize, bucket_len: usize, entry: usize) -> Self {
-        Location {
-            len: bucket_len,
-            entry,
-            bucket,
-        }
-    }
-    #[inline(always)]
-    pub const fn bucket(index: usize) -> usize {
-        let skipped = index.checked_add(SKIP).expect("exceeded maximum length");
-        let bucket = usize::BITS - skipped.leading_zeros();
-        (bucket as usize) - (SKIP_BUCKET + 1)
-    }
-    #[inline(always)]
-    pub const fn of(index: usize) -> Location {
-        let skipped = index.checked_add(SKIP).expect("exceeded maximum length");
-        let bucket = usize::BITS - skipped.leading_zeros();
-        let bucket = (bucket as usize) - (SKIP_BUCKET + 1);
-        let bucket_len = Location::bucket_len(bucket);
-        let entry = skipped ^ bucket_len;
-
-        Location {
-            len: bucket_len,
-            entry,
-            bucket: bucket as isize,
-        }
-    }
-    #[inline(always)]
-    pub const fn bucket_len(bucket: usize) -> usize {
-        1 << (bucket + SKIP_BUCKET)
-    }
-    #[inline(always)]
-    pub const fn bucket_capacity(bucket: usize) -> usize {
-        (1 << (bucket + SKIP_BUCKET + 1)) - SKIP
-    }
-    #[inline(always)]
-    pub const fn index(&self, capacity: usize) -> usize {
-        if self.bucket < 0 {
-            return self.entry;
-        }
-        ((i32::MAX as u32) >> (u32::BITS - 1 - self.bucket as u32) << SKIP_BUCKET) as usize
-            + self.entry
-            + capacity
+impl<T> BucketSegments<'_, T> {
+    pub fn index(&self) -> usize {
+        self.cursor.position
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        mem::ManuallyDrop,
-        sync::{Arc, Mutex},
-    };
-
-    use crate::*;
-    static mut AAA: u64 = 0;
-
-    #[test]
-    fn test_iter() {
-        let arr = buckets![1, 2, 4];
-        arr.insert(&Location::of(98), 98);
-        let mut iterator = arr.iter();
-        assert_eq!(iterator.size_hint().0, 32);
-        let r = iterator.next().unwrap();
-        assert_eq!((iterator.index() - 1, *r), (0, 1));
-        let r = iterator.next().unwrap();
-        assert_eq!((iterator.index() - 1, *r), (1, 2));
-        let r = iterator.next().unwrap();
-        assert_eq!((iterator.index() - 1, *r), (2, 4));
-        for i in 3..32 {
-            let r = iterator.next().unwrap();
-            assert_eq!((iterator.index() - 1, *r), (i, 0));
-        }
-        for i in 96..98 {
-            let r = iterator.next().unwrap();
-            assert_eq!((iterator.index() - 1, *r), (i, 0));
-        }
-        let r = iterator.next().unwrap();
-        assert_eq!((iterator.index() - 1, *r), (98, 98));
-        for i in 99..224 {
-            let r = iterator.next().unwrap();
-            assert_eq!((iterator.index() - 1, *r), (i, 0));
-        }
-        assert_eq!(iterator.next(), None);
-        assert_eq!(iterator.size_hint().0, 0);
+impl<'a, T> Iterator for BucketSegments<'a, T> {
+    type Item = &'a [T];
+    fn next(&mut self) -> Option<Self::Item> {
+        // Each nonempty span is initialized, contiguous, and borrowed for 'a.
+        self.cursor
+            .next_segment()
+            .map(|(ptr, len)| unsafe { std::slice::from_raw_parts(ptr, len) })
     }
-    #[test]
-    fn test_arc() {
-        let arr = Arc::new(crate::Buckets::new());
-
-        // spawn 6 threads that append to the arr
-        let threads = (0..6)
-            .map(|i| {
-                let arr = arr.clone();
-
-                std::thread::spawn(move || {
-                    arr.insert(&Location::of(i), i);
-                })
-            })
-            .collect::<Vec<_>>();
-
-        // wait for the threads to finish
-        for thread in threads {
-            thread.join().unwrap();
-        }
-
-        for i in 0..6 {
-            assert!(arr.iter().any(|x| *x == i));
-        }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (
+            usize::from(self.cursor.remaining != 0),
+            Some(self.cursor.end - self.cursor.position),
+        )
     }
-    #[test]
-    fn test_arc1() {
-        let vec: Vec<Option<Arc<usize>>> = Vec::new();
-        let vec1 = vec.clone();
-        println!(
-            "test_arc1 start:, {:?}",
-            ManuallyDrop::new(vec1).as_mut_ptr()
-        );
-        let a1 = {
-            let arr = crate::Buckets::new();
-            for i in 0..6 {
-                arr.insert(&Location::of(i), Some(Arc::new(i)));
-            }
-
-            for i in 0..6 {
-                assert_eq!(arr[i].as_ref().unwrap().as_ref(), &i);
-            }
-            let a2 = arr.clone();
-            assert_eq!(Arc::<usize>::strong_count(a2[0].as_ref().unwrap()), 2);
-            a2
-        };
-        assert_eq!(Arc::<usize>::strong_count(a1[0].as_ref().unwrap()), 1);
-        println!("test_arc1 {:?}", a1[0]);
+}
+pub struct BucketSegmentsMut<'a, T> {
+    cursor: SegmentCursor<'a, T>,
+    exclusive: PhantomData<&'a mut T>,
+}
+impl<'a, T> Iterator for BucketSegmentsMut<'a, T> {
+    type Item = &'a mut [T];
+    fn next(&mut self) -> Option<Self::Item> {
+        // Exclusive self borrow and disjoint, one-time segment visitation.
+        self.cursor
+            .next_segment()
+            .map(|(ptr, len)| unsafe { std::slice::from_raw_parts_mut(ptr, len) })
     }
-    #[test]
-    fn test_mutex() {
-        let arr = Arc::new(crate::Buckets::new());
-
-        // set an element
-        arr.insert(&Location::of(0), Some(Mutex::new(1)));
-
-        let thread = std::thread::spawn({
-            let arr = arr.clone();
-            move || {
-                // mutate through the mutex
-                *(arr[0].as_ref().unwrap().lock().unwrap()) += 1;
-            }
-        });
-
-        thread.join().unwrap();
-
-        let x = arr[0].as_ref().unwrap().lock().unwrap();
-        assert_eq!(*x, 2);
-    }
-    #[test]
-    fn location() {
-        assert_eq!(Location::of(31).bucket, 0);
-        assert_eq!(Location::of(31).entry, 31);
-        assert_eq!(Location::of(31).len, 32);
-        assert_eq!(Location::of(32).bucket, 1);
-        assert_eq!(Location::of(32).entry, 0);
-        assert_eq!(Location::of(32).len, 64);
-        assert_eq!(Location::bucket_len(0), 32);
-        assert_eq!(0usize.saturating_sub(0), 0);
-        assert_eq!(Location::new(-1, 32, 1).index(0), 1);
-
-        for i in 0..32 {
-            let loc = Location::of(i);
-            assert_eq!(loc.len, 32);
-            assert_eq!(loc.bucket, 0);
-            assert_eq!(loc.entry, i);
-            assert_eq!(loc.index(0), i);
-            assert_eq!(Location::bucket(i), loc.bucket as usize);
-            assert_eq!(Location::bucket_capacity(loc.bucket as usize), 32);
-        }
-
-        assert_eq!(Location::bucket_len(1), 64);
-        for i in 33..96 {
-            let loc = Location::of(i);
-            assert_eq!(loc.len, 64);
-            assert_eq!(loc.bucket, 1);
-            assert_eq!(loc.entry, i - 32);
-            assert_eq!(loc.index(0), i);
-            assert_eq!(Location::bucket(i), loc.bucket as usize);
-            assert_eq!(Location::bucket_capacity(loc.bucket as usize), 96);
-        }
-
-        assert_eq!(Location::bucket_len(2), 128);
-        for i in 96..224 {
-            let loc = Location::of(i);
-            assert_eq!(loc.len, 128);
-            assert_eq!(loc.bucket, 2);
-            assert_eq!(loc.entry, i - 96);
-            assert_eq!(loc.index(0), i);
-            assert_eq!(Location::bucket(i), loc.bucket as usize);
-            assert_eq!(Location::bucket_capacity(loc.bucket as usize), 224);
-        }
-
-        let max = Location::of(MAX_ENTRIES);
-        assert_eq!(max.bucket as usize, BUCKETS - 1);
-        assert_eq!(max.len, 1 << 31);
-        assert_eq!(max.entry, (1 << 31) - 1);
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (
+            usize::from(self.cursor.remaining != 0),
+            Some(self.cursor.end - self.cursor.position),
+        )
     }
 }
