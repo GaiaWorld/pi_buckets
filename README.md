@@ -149,7 +149,7 @@ assert_eq!(loc.index(0), 33); // 绝对位置
 ## API 迁移与安全要求
 
 - `load`、`load_alloc`、`load_unchecked` 和 `insert` 为 `unsafe`：返回借用或替换操作期间，目标元素不能存在其他引用或并发访问，存储必须保持有效。读取迭代器和切片也会产生别名。
-- `take` 要求 `&mut self`，将精确分配转换为拥有所有权的 `Vec`；不再公开原子指针表。
+- 0.3.0 的 `take(&mut self)` 返回 `[Box<[T]>; BUCKETS]`，直接转移原分配的所有权并清空对象槽；未分配桶返回空装箱切片，不复制元素或分配新的元素存储。需要 `Vec<T>` 的调用方可显式使用 `into_vec()`；不再公开原子指针表。
 - `Location` 字段私有；使用 `bucket_index()`、`entry()`、`len()`。`of` 检查最大索引，`new(bucket: usize, entry: usize)` 验证桶与桶内位置；两者均在构造时推导并缓存桶长度。`Default` 为 `new(0, 0)`，桶长度为 32。
 - `iter`、`slice` 返回 `&T`；可变访问使用 `iter_mut`、`slice_mut`、`segments_mut`，均要求独占借用。
 - `BucketIter::with_prefix(&[T], &Buckets<T>, range)` 安全读取已初始化主数组及后续桶；`into_segments()` 返回切片迭代器。

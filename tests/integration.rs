@@ -218,8 +218,38 @@ fn empty_iterators_and_zst() {
     let mut arr = Buckets::<()>::with_capacity(33);
     assert_eq!(arr.iter().count(), 96);
     assert_eq!(arr.iter_mut().collect::<Vec<_>>().len(), 96);
-    assert_eq!(arr.clone().take().iter().map(Vec::len).sum::<usize>(), 96);
+    assert_eq!(
+        arr.clone()
+            .take()
+            .iter()
+            .map(|part| part.len())
+            .sum::<usize>(),
+        96
+    );
     assert_eq!(Buckets::<u8>::new().iter().count(), 0);
+}
+
+#[test]
+fn take_preserves_sparse_bucket_storage_and_allows_reuse() {
+    let mut arr = Buckets::<String>::new();
+    let empty: [Box<[String]>; BUCKETS] = arr.take();
+    assert!(empty.iter().all(|part| part.is_empty()));
+    arr.set(&Location::of(98), "owned".into());
+    let address = arr.get(&Location::of(96)).unwrap() as *const String;
+    let detached: [Box<[String]>; BUCKETS] = arr.take();
+    assert_eq!(detached[2].as_ptr(), address);
+    assert_eq!(detached[2].len(), 128);
+    assert_eq!(detached[2][2], "owned");
+    assert!(detached
+        .iter()
+        .enumerate()
+        .all(|(i, part)| i == 2 || part.is_empty()));
+    assert!(arr.get(&Location::of(98)).is_none());
+    assert!(arr.take().iter().all(|part| part.is_empty()));
+    arr.set(&Location::of(98), "replacement".into());
+    assert_eq!(arr[98], "replacement");
+    drop(arr);
+    assert_eq!(detached[2][2], "owned");
 }
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -273,7 +303,12 @@ fn panic_raii_poison_recovery_and_destructors() {
     let clone = arr.clone();
     assert_eq!(LIVE.load(Ordering::SeqCst), 192);
     drop(clone);
-    let detached = arr.take();
+    let first_address = arr.get(&Location::of(0)).unwrap() as *const Tracked;
+    let detached: [Box<[Tracked]>; BUCKETS] = arr.take();
+    assert_eq!(detached[0].as_ptr(), first_address);
+    assert_eq!(detached[0].len(), 32);
+    assert_eq!(detached[1].len(), 64);
+    assert!(detached[2..].iter().all(|part| part.is_empty()));
     assert_eq!(arr.iter().count(), 0);
     drop(arr);
     assert_eq!(LIVE.load(Ordering::SeqCst), 96);

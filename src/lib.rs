@@ -159,16 +159,19 @@ impl<T> Buckets<T> {
         unsafe { &mut *self.entries(location.bucket).add(location.entry) }
     }
 
-    /// 将所有桶的所有权转移到按桶编号排列的向量数组，并清空对象槽。
-    /// 未分配桶对应空向量；向量包含整桶元素（含默认值），并负责销毁和释放。
+    /// 将所有桶的所有权转移到按桶编号排列的装箱切片数组，并清空对象槽。
+    /// 未分配桶对应空切片；切片包含整桶元素（含默认值），并负责销毁和释放。
+    /// 保留原分配和元素地址，不复制元素，也不分配新的元素存储。
     /// 独占借用排除存活的安全引用。
-    pub fn take(&mut self) -> [Vec<T>; BUCKETS] {
-        let mut result = std::array::from_fn(|_| Vec::new());
+    pub fn take(&mut self) -> [Box<[T]>; BUCKETS] {
+        let mut result = std::array::from_fn(|_| Box::default());
         for (i, bucket) in self.buckets.iter_mut().enumerate() {
             let ptr = replace(bucket.get_mut(), null_mut());
             if !ptr.is_null() {
                 // Exclusive ownership, exact boxed-slice layout, detached once.
-                result[i] = unsafe { to_bucket_vec(ptr, i) };
+                result[i] = unsafe {
+                    Box::from_raw(ptr::slice_from_raw_parts_mut(ptr, Location::bucket_len(i)))
+                };
             }
         }
         result
@@ -448,17 +451,6 @@ impl<T: Clone> Clone for Buckets<T> {
 pub fn bucket_alloc<T: Default>(len: usize) -> *mut T {
     let entries: Box<[T]> = std::iter::repeat_with(T::default).take(len).collect();
     Box::into_raw(entries).cast::<T>()
-}
-
-unsafe fn to_bucket_vec<T>(ptr: *mut T, bucket: usize) -> Vec<T> {
-    // Only detached allocations owned by Buckets reach this conversion.
-    unsafe {
-        Box::from_raw(ptr::slice_from_raw_parts_mut(
-            ptr,
-            Location::bucket_len(bucket),
-        ))
-        .into_vec()
-    }
 }
 
 /// 已验证的桶内元素位置，不表示迭代终点或尾后位置，也不保证对应桶已分配。
