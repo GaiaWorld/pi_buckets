@@ -47,24 +47,25 @@ fn locations_and_capacity_boundaries() {
 }
 
 #[test]
-fn shared_gaps_indices_and_hints() {
+fn shared_gaps_content_and_hints() {
     let mut arr = buckets![1, 2, 4];
     arr.set(&Location::of(98), 98);
     let mut it = arr.slice(1..100);
     assert_eq!(it.size_hint(), (31, Some(99)));
+    let expected = (1..32).chain(96..100).map(|i| arr[i]).collect::<Vec<_>>();
     let mut seen = Vec::new();
     loop {
         let (lower, upper) = it.size_hint();
-        let actual = arr.slice(it.index()..100).count();
+        let actual = expected.len() - seen.len();
         assert!(lower <= actual && actual <= upper.unwrap());
         match it.next() {
-            Some(value) => seen.push((it.index() - 1, *value)),
+            Some(value) => seen.push(*value),
             None => break,
         }
     }
-    assert_eq!(seen.len(), 35);
-    assert_eq!(seen[31], (96, 0));
-    assert_eq!(seen[33], (98, 98));
+    assert_eq!(seen, expected);
+    assert_eq!(seen[31], 0);
+    assert_eq!(seen[33], 98);
     assert_eq!(it.size_hint(), (0, Some(0)));
     assert_eq!(it.next(), None);
     // Shared iterators may coexist and their yielded values remain shared.
@@ -110,6 +111,53 @@ fn prefix_within_crossing_empty_and_raw() {
         arr.slice_row(3..6, 3).copied().collect::<Vec<_>>(),
         [10, 11, 12]
     );
+    let mut within = BucketIter::with_prefix(&prefix, &arr, 1..3);
+    assert_eq!(within.size_hint(), (2, Some(2)));
+    assert_eq!(within.next(), Some(&2));
+    assert_eq!(within.size_hint(), (1, Some(1)));
+    let mut parts = within.into_segments();
+    assert_eq!(parts.size_hint(), (1, Some(1)));
+    assert_eq!(parts.next(), Some(&[3][..]));
+    assert_eq!(parts.size_hint(), (0, Some(0)));
+    assert_eq!(parts.next(), None);
+
+    let mut crossing = BucketIter::with_prefix(&prefix, &arr, 1..6);
+    assert_eq!(crossing.size_hint(), (2, Some(5)));
+    assert_eq!(crossing.next(), Some(&2));
+    assert_eq!(crossing.size_hint(), (1, Some(4)));
+    let mut parts = crossing.into_segments();
+    assert_eq!(parts.size_hint(), (1, Some(4)));
+    assert_eq!(parts.next(), Some(&[3][..]));
+    assert_eq!(parts.size_hint(), (0, Some(3)));
+    assert_eq!(parts.next(), Some(&[10, 11, 12][..]));
+    assert_eq!(parts.size_hint(), (0, Some(0)));
+    assert_eq!(parts.next(), None);
+
+    let mut crossing = BucketIter::with_prefix(&prefix, &arr, 2..6);
+    assert_eq!(crossing.next(), Some(&3));
+    assert_eq!(crossing.size_hint(), (0, Some(3)));
+    assert_eq!(crossing.next(), Some(&10));
+    assert_eq!(crossing.size_hint(), (2, Some(2)));
+    let mut parts = crossing.into_segments();
+    assert_eq!(parts.size_hint(), (1, Some(2)));
+    assert_eq!(parts.next(), Some(&[11, 12][..]));
+    assert_eq!(parts.size_hint(), (0, Some(0)));
+    assert_eq!(parts.next(), None);
+
+    for range in [1..1, 3..3, 6..6] {
+        let mut empty = BucketIter::with_prefix(&prefix, &arr, range);
+        assert_eq!(empty.size_hint(), (0, Some(0)));
+        assert_eq!(empty.next(), None);
+        let mut parts = empty.into_segments();
+        assert_eq!(parts.size_hint(), (0, Some(0)));
+        assert_eq!(parts.next(), None);
+    }
+    let reversed = std::ops::Range { start: 2, end: 1 };
+    assert!(catch_unwind(|| BucketIter::with_prefix(&prefix, &arr, reversed)).is_err());
+    assert!(catch_unwind(|| {
+        BucketIter::with_prefix(&prefix, &arr, 0..prefix.len() + MAX_ENTRIES + 2)
+    })
+    .is_err());
 }
 
 #[test]
@@ -149,7 +197,16 @@ fn segment_slices_and_exclusive_iteration() {
             .collect::<Vec<_>>(),
         [4]
     );
-    assert_eq!(gaps.slice_mut(0..100).count(), 4);
+    let mut mutable = gaps.slice_mut(0..100);
+    assert_eq!(mutable.size_hint(), (4, Some(4)));
+    assert_eq!(mutable.next(), Some(&mut 0));
+    assert_eq!(mutable.size_hint(), (3, Some(3)));
+    assert_eq!(mutable.map(|value| *value).collect::<Vec<_>>(), [0, 8, 0]);
+    let mut parts = gaps.segments_mut(0..100);
+    assert_eq!(parts.size_hint(), (1, Some(4)));
+    assert_eq!(parts.next().unwrap(), [0, 0, 8, 0]);
+    assert_eq!(parts.size_hint(), (0, Some(0)));
+    assert_eq!(parts.next(), None);
 }
 
 #[test]

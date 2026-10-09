@@ -153,9 +153,10 @@ assert_eq!(loc.index(0), 33); // 绝对位置
 - `Location` 字段私有；使用 `bucket_index()`、`entry()`、`len()`。`of` 检查最大索引，`new(bucket: usize, entry: usize)` 验证桶与桶内位置；两者均在构造时推导并缓存桶长度。`Default` 为 `new(0, 0)`，桶长度为 32。
 - `iter`、`slice` 返回 `&T`；可变访问使用 `iter_mut`、`slice_mut`、`segments_mut`，均要求独占借用。
 - `BucketIter::with_prefix(&[T], &Buckets<T>, range)` 安全读取已初始化主数组及后续桶；`into_segments()` 返回切片迭代器。
+- `BucketIter`、`BucketIterMut`、`BucketSegments` 不再提供 `index()`，不暴露绝对游标位置；`Location::index(capacity)` 保留用于位置转换。内部扫描位置和结束位置均相对于扩展桶起点，不保存前缀长度。
 - 旧 `BucketIter::new` 已移除。`unsafe BucketIter::from_raw_prefix(ptr, prefix_len, buckets, range)` 要求前缀已初始化、对齐、生命周期足够且没有冲突访问；容量不等于初始化长度。
 - `slice_row(range, capacity)` 仅处理桶部分，要求范围起点不在主数组内部。所有范围必须有序，桶部分的排他终点不超过 `MAX_ENTRIES + 1`。32 位计算避免移位或相加溢出。
-- 未分配桶被跳过；已分配桶的所有默认元素均参与迭代。`size_hint` 下界为当前段剩余元素，上界为逻辑范围剩余长度，未来桶的并发分配不是快照。
+- 未分配桶被跳过；已分配桶的所有默认元素均参与迭代。逐元素 `size_hint` 下界为当前段剩余元素，上界为当前段剩余元素加尚未扫描的桶跨度（含空桶）；前缀段也计入剩余元素。连续段迭代的下界为当前段非空时的一，否则为零，上界同为剩余逻辑元素数。未来桶的并发分配不是快照。
 - `load_alloc_bucket` 仍是安全的裸指针分配接口，长度由有效 `Location` 推导；解引用必须自行满足边界、生命周期、别名和线程条件，不得释放借用指针。`bucket_alloc` 返回拥有所有权的精确长度分配，调用方负责按对应切片布局释放。
 - `Buckets<T>: Sync` 要求 `T: Send + Sync`。
 
