@@ -432,10 +432,9 @@ impl<T: Clone> Clone for Buckets<T> {
         for (i, bucket) in self.buckets.iter().enumerate() {
             let ptr = bucket.load(Ordering::Acquire);
             if !ptr.is_null() {
-                // Borrow source, never reconstruct source ownership. Both the
-                // partial clone and installed target buckets have RAII owners.
+                // 安全：Acquire 观察完整初始化；只借用源桶，副本由 Box 和 result 负责回收。
                 let source = unsafe { std::slice::from_raw_parts(ptr, Location::bucket_len(i)) };
-                let target = source.to_vec().into_boxed_slice();
+                let target = Box::<[T]>::from(source);
                 *result.buckets[i].get_mut() = Box::into_raw(target).cast::<T>();
             }
         }
