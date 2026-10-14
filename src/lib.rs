@@ -707,6 +707,15 @@ pub struct BucketIterMut<'a, T> {
     cursor: SegmentCursor<'a, T>,
     exclusive: PhantomData<&'a mut T>,
 }
+impl<T> BucketIterMut<'_, T> {
+    /// Returns the logical index of the next element; gaps are skipped.
+    pub fn next_index(&mut self) -> Option<usize> {
+        if self.cursor.remaining == 0 && !self.cursor.advance() {
+            return None;
+        }
+        Some(self.cursor.scan - self.cursor.remaining)
+    }
+}
 impl<'a, T> Iterator for BucketIterMut<'a, T> {
     type Item = &'a mut T;
     /// 返回下一个元素的独占引用，每个元素至多一次；范围耗尽时返回 `None`。
